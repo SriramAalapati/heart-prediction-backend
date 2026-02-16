@@ -1,5 +1,5 @@
 # ============================================================
-# 🏥 HEART DISEASE RISK API - PRODUCTION VERSION
+# 🏥 HEART DISEASE RISK API - UNIVERSAL PRODUCTION BUILD
 # ============================================================
 import os
 import sys
@@ -10,12 +10,21 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sklearn.base import BaseEstimator, TransformerMixin
+import warnings
+
+warnings.filterwarnings("ignore")
+# ------------------------------------------------------------
+# 1. THE "NUCLEAR FIX" FOR JOBLIB/PICKLE
+# ------------------------------------------------------------
+# This forces the unpickler to look at THIS file when it asks for "__main__"
+# This solves the "AttributeError: module '__main__' has no attribute..."
+# This must run before classes are defined.
+if __name__ != '__main__':
+    sys.modules['__main__'] = sys.modules[__name__]
 
 # ------------------------------------------------------------
-# 1. ROBUST CUSTOM CLASSES 
-# (Must exactly match the code used during training)
+# 2. DEFINE CUSTOM CLASSES (Must exactly match training code)
 # ------------------------------------------------------------
-
 class OutlierCapper(BaseEstimator, TransformerMixin):
     def __init__(self, factor=1.5):
         super().__init__()
@@ -95,21 +104,7 @@ class DataAugmenter(BaseEstimator, TransformerMixin):
 
 
 # ------------------------------------------------------------
-# 2. CRITICAL FIX: NAMESPACE PATCHING
-# ------------------------------------------------------------
-# This tricks joblib into finding the classes in the "__main__" namespace
-# even though we are running via uvicorn
-try:
-    import __main__
-    setattr(__main__, "OutlierCapper", OutlierCapper)
-    setattr(__main__, "DataAugmenter", DataAugmenter)
-    print("✅ Namespace patched for Joblib compatibility.")
-except Exception as e:
-    print(f"⚠️ Namespace patch warning: {e}")
-
-
-# ------------------------------------------------------------
-# 3. SETUP & MODEL LOADING
+# 3. INITIALIZE APP & LOAD MODELS
 # ------------------------------------------------------------
 app = FastAPI()
 
@@ -121,23 +116,50 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# DYNAMIC PATH FINDING (Works on Local AND Render)
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 MODELS_PATH = os.path.join(BASE_PATH, "models")
 
-print(f"📂 Looking for models in: {MODELS_PATH}")
+print(f"📂 Model Directory: {MODELS_PATH}")
 
-try:
-    preprocessing_pipeline_A = joblib.load(os.path.join(MODELS_PATH, 'preprocessing_pipeline_A.joblib'))
-    preprocessing_pipeline_B = joblib.load(os.path.join(MODELS_PATH, 'preprocessing_pipeline_B.joblib'))
-    preprocessing_pipeline_C = joblib.load(os.path.join(MODELS_PATH, 'preprocessing_pipeline_C.joblib'))
-    trying_stacking_clf = joblib.load(os.path.join(MODELS_PATH, 'StackingClassifier_ensemble.joblib'))
-    ensemble_imputer = joblib.load(os.path.join(MODELS_PATH, 'Ensemble_Imputer.joblib'))
-    global_target_features = joblib.load(os.path.join(MODELS_PATH, 'global_features.joblib'))
-    print("✅ All Models Loaded Successfully!")
-except FileNotFoundError as e:
-    print(f"❌ MODEL NOT FOUND: {e}")
-except Exception as e:
-    print(f"❌ FATAL ERROR LOADING MODELS: {e}")
+# Global variables
+preprocessing_pipeline_A = None
+preprocessing_pipeline_B = None
+preprocessing_pipeline_C = None
+final_model = None
+ensemble_imputer = None
+global_target_features = None
+
+def load_models():
+    global preprocessing_pipeline_A, preprocessing_pipeline_B, preprocessing_pipeline_C
+    global final_model, ensemble_imputer, global_target_features
+    
+    try:
+        preprocessing_pipeline_A = joblib.load(os.path.join(MODELS_PATH, 'preprocessing_pipeline_A.joblib'))
+        preprocessing_pipeline_B = joblib.load(os.path.join(MODELS_PATH, 'preprocessing_pipeline_B.joblib'))
+        preprocessing_pipeline_C = joblib.load(os.path.join(MODELS_PATH, 'preprocessing_pipeline_C.joblib'))
+        ensemble_imputer = joblib.load(os.path.join(MODELS_PATH, 'Ensemble_Imputer.joblib'))
+        global_target_features = joblib.load(os.path.join(MODELS_PATH, 'global_features.joblib'))
+        
+        # Try loading VotingClassifier first, if not found, try StackingClassifier
+        try:
+            final_model = joblib.load(os.path.join(MODELS_PATH, 'VotingClassifier_ensemble.joblib'))
+            print("✅ Loaded VotingClassifier")
+        except:
+            print("⚠️ VotingClassifier not found, trying StackingClassifier...")
+            final_model = joblib.load(os.path.join(MODELS_PATH, 'StackingClassifier_ensemble.joblib'))
+            print("✅ Loaded StackingClassifier")
+            
+        print("✅ ALL MODELS LOADED SUCCESSFULLY!")
+        
+    except Exception as e:
+        print("\n❌ FATAL ERROR LOADING MODELS")
+        print(f"Error: {e}")
+        # We do NOT exit here so the server can at least start and show the error log
+        # But predictions will fail safely.
+
+# Load models on startup
+load_models()
 
 
 # ------------------------------------------------------------
@@ -169,42 +191,27 @@ def transform_to_df(pipeline, df_raw):
     arr = pipeline.transform(df_raw)
     if isinstance(arr, pd.DataFrame):
         return arr
-
     try:
-        if hasattr(pipeline, 'get_feature_names_out'):
-            cols = pipeline.get_feature_names_out()
-        else:
-            cols = pipeline.steps[-1][1].get_feature_names_out()
-    except Exception:
+        cols = pipeline.get_feature_names_out() if hasattr(pipeline, 'get_feature_names_out') else pipeline.steps[-1][1].get_feature_names_out()
+    except:
         cols = [f"feat_{i}" for i in range(arr.shape[1])]
-
     return pd.DataFrame(arr, columns=cols)
 
 def align_dataframe_to_features(df, features):
-    if not isinstance(df, pd.DataFrame):
-        raise ValueError(f"Expected DataFrame, got {type(df)}")
-    
     aligned_df = pd.DataFrame(index=df.index)
     for feature in features:
-        if feature in df.columns:
-            aligned_df[feature] = df[feature]
-        else:
-            aligned_df[feature] = np.nan
+        aligned_df[feature] = df[feature] if feature in df.columns else np.nan
     return aligned_df
 
 
 # ------------------------------------------------------------
 # 5. API ENDPOINTS
 # ------------------------------------------------------------
-
-# ADDED: Health Check to stop Render 404 logs
 @app.get("/")
 def health_check():
+    if final_model is None:
+        return {"status": "error", "message": "Models failed to load. Check server logs."}
     return {"status": "active", "message": "Heart Disease API is running."}
-
-@app.get("/health")
-def health_check2():
-    return {"status": "ok"}
 
 class PatientData(BaseModel):
     age_years: float
@@ -229,6 +236,9 @@ class PatientData(BaseModel):
 
 @app.post("/predict")
 def predict(patient: PatientData):
+    if final_model is None:
+        return {"error": "Models are not loaded. Please check server logs for errors during startup."}
+
     data = patient.model_dump()
     print(f"\n📥 Input: {data}")
 
@@ -247,12 +257,11 @@ def predict(patient: PatientData):
         X_ensemble = X_ensemble.loc[:, ~X_ensemble.columns.duplicated()]
 
         X_final = pd.DataFrame(ensemble_imputer.transform(X_ensemble), columns=X_ensemble.columns)
-        proba = trying_stacking_clf.predict_proba(X_final)[0, 1]
-
-        if proba >= 0.7: risk = "HIGH"
-        elif proba >= 0.4: risk = "MEDIUM"
-        else: risk = "LOW"
         
+        # Predict
+        proba = final_model.predict_proba(X_final)[0, 1]
+
+        risk = "HIGH" if proba >= 0.7 else ("MEDIUM" if proba >= 0.4 else "LOW")
         final_prediction = "Heart Disease" if proba > 0.5 else "Healthy"
 
         result = {
@@ -267,6 +276,9 @@ def predict(patient: PatientData):
         print(f"❌ Error: {e}")
         return {"error": str(e)}
 
+# ------------------------------------------------------------
+# 6. LOCAL EXECUTION (Not used by Render)
+# ------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
