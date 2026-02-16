@@ -1,7 +1,8 @@
 # ============================================================
-# 🏥 HEART DISEASE RISK API - LOCAL/PRODUCTION VERSION
+# 🏥 HEART DISEASE RISK API - PRODUCTION VERSION
 # ============================================================
 import os
+import sys
 import joblib
 import pandas as pd
 import numpy as np
@@ -94,7 +95,21 @@ class DataAugmenter(BaseEstimator, TransformerMixin):
 
 
 # ------------------------------------------------------------
-# 2. SETUP & MODEL LOADING
+# 2. CRITICAL FIX: NAMESPACE PATCHING
+# ------------------------------------------------------------
+# This tricks joblib into finding the classes in the "__main__" namespace
+# even though we are running via uvicorn
+try:
+    import __main__
+    setattr(__main__, "OutlierCapper", OutlierCapper)
+    setattr(__main__, "DataAugmenter", DataAugmenter)
+    print("✅ Namespace patched for Joblib compatibility.")
+except Exception as e:
+    print(f"⚠️ Namespace patch warning: {e}")
+
+
+# ------------------------------------------------------------
+# 3. SETUP & MODEL LOADING
 # ------------------------------------------------------------
 app = FastAPI()
 
@@ -106,8 +121,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# AUTOMATIC PATH DETECTION
-# This looks for the 'models' folder in the same directory as this script
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 MODELS_PATH = os.path.join(BASE_PATH, "models")
 
@@ -123,13 +136,12 @@ try:
     print("✅ All Models Loaded Successfully!")
 except FileNotFoundError as e:
     print(f"❌ MODEL NOT FOUND: {e}")
-    print("⚠️ Please make sure you created a 'models' folder and put the .joblib files inside it.")
 except Exception as e:
     print(f"❌ FATAL ERROR LOADING MODELS: {e}")
 
 
 # ------------------------------------------------------------
-# 3. HELPER FUNCTIONS
+# 4. HELPER FUNCTIONS
 # ------------------------------------------------------------
 def create_patient_dfs(data: dict):
     col_names_A = ['age_years', 'gender', 'smoke', 'alcohol', 'physical_activity']
@@ -182,8 +194,18 @@ def align_dataframe_to_features(df, features):
 
 
 # ------------------------------------------------------------
-# 4. API ENDPOINT
+# 5. API ENDPOINTS
 # ------------------------------------------------------------
+
+# ADDED: Health Check to stop Render 404 logs
+@app.get("/")
+def health_check():
+    return {"status": "active", "message": "Heart Disease API is running."}
+
+@app.get("/health")
+def health_check2():
+    return {"status": "ok"}
+
 class PatientData(BaseModel):
     age_years: float
     gender: int
@@ -245,11 +267,6 @@ def predict(patient: PatientData):
         print(f"❌ Error: {e}")
         return {"error": str(e)}
 
-# ------------------------------------------------------------
-# 5. EXECUTION BLOCK
-# ------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    # This block only runs if you run 'python main.py' directly.
-    # If you run 'uvicorn main:app', this block is skipped, which is what we want.
     uvicorn.run(app, host="0.0.0.0", port=8000)
