@@ -213,6 +213,11 @@ def health_check():
         return {"status": "error", "message": "Models failed to load. Check server logs."}
     return {"status": "active", "message": "Heart Disease API is running."}
 
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
 class PatientData(BaseModel):
     age_years: float
     gender: int
