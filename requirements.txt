@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 pandas
-numpy
+numpy<2.0.0
 joblib
 pydantic
 python-multipart
